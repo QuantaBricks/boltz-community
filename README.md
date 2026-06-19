@@ -80,6 +80,38 @@ Community-maintained fork of [Boltz](https://github.com/jwohlwend/boltz) with bu
 - 283 tests in this fork vs. 5 tests in current upstream `jwohlwend/boltz`: unit tests (CPU), smoke tests (end-to-end inference), regression tests (golden output verification for Boltz-1 and Boltz-2), determinism tests, MSA trim subsequence matching (8 cases), diffusion chunking regression tests, Boltz-2 validation constructor coverage, and featurizer pre-allocation correctness
 - GitHub Actions CI with CPU runners (every push/PR) and GPU T4 runners (push to main)
 
+## Prediction Server
+
+This fork ships a local FastAPI server that accepts TOML prediction requests and runs `boltz predict` in the background.
+
+```bash
+uv sync --extra server
+
+# Start (real GPU)
+uv run python server.py
+
+# Start (no GPU — mock mode for testing)
+BOLTZ_MOCK=1 uv run python server.py
+```
+
+Submit a job and poll results:
+
+```bash
+# Submit
+curl -X POST http://localhost:17843/predict \
+  -H 'Content-Type: application/json' \
+  -d '{"toml": "version = 1\n\n[[sequences]]\nprotein.id = \"A\"\nprotein.sequence = \"MVTPEG...\"\n"}'
+# {"job_id": "abc123...", "status": "pending"}
+
+# Poll status: pending → running → completed / failed
+curl http://localhost:17843/jobs/abc123...
+
+# Fetch results
+curl http://localhost:17843/jobs/abc123.../result
+```
+
+Templates are passed inline — no separate file upload needed. See **[docs/server.md](docs/server.md)** for the full TOML format reference, template usage, and all endpoints.
+
 ## Contributing
 
 Pull requests are welcome! If you have a bug fix, test improvement, or compatibility enhancement, please open a PR.
