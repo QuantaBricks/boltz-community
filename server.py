@@ -204,7 +204,8 @@ async def _run_boltz(job_id: str, yaml_path: Path, out_dir: Path, extra_args: st
     job["status"] = "running"
     job["updated_at"] = time.time()
 
-    cmd = [sys.executable, "-m", "boltz", "predict", str(yaml_path), "--out_dir", str(out_dir)]
+    boltz_bin = str(Path(sys.executable).parent / "boltz")
+    cmd = [boltz_bin, "predict", str(yaml_path), "--out_dir", str(out_dir)]
     if needs_server:
         cmd += ["--use_msa_server"]
     if extra_args:
