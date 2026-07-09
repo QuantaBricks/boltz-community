@@ -169,3 +169,5 @@ cython_debug/
 boltz_results_*/.idea/
 .idea/
 .claude/
+API_GUIDE.md
+jobs/

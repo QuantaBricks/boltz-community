@@ -64,7 +64,6 @@ import json
 import os
 import shutil
 import sys
-import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -85,6 +84,10 @@ except ImportError:
         raise ImportError(msg) from e
 
 MOCK = os.environ.get("BOLTZ_MOCK", "0") == "1"
+
+SERVER_DIR = Path(__file__).parent
+JOBS_DIR = SERVER_DIR / "jobs"
+JOBS_DIR.mkdir(exist_ok=True)
 
 MSA_CACHE_DIR = Path(os.environ.get("BOLTZ_MSA_CACHE", Path.home() / ".boltz" / "msa_cache"))
 MSA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -291,7 +294,8 @@ async def _run_mock(job_id: str, yaml_path: Path, out_dir: Path) -> None:
 @app.post("/predict", status_code=202)
 async def predict(req: PredictRequest):
     job_id = uuid.uuid4().hex
-    work_dir = Path(tempfile.mkdtemp(prefix=f"boltz_{job_id}_"))
+    work_dir = JOBS_DIR / job_id
+    work_dir.mkdir()
     out_dir = work_dir / "out"
     out_dir.mkdir()
 
