@@ -14,17 +14,22 @@ once and reuses it for every record; `--batch_size K` additionally packs K
 structure inferences into one forward pass (the affinity phase always runs one
 record at a time).
 
-Measured speed‑up (117 aa receptor, reduced sampling, affinity on):
+Measured on an RTX 5090, affinity on, `--seed 42`:
 
-| ligands | one‑process‑per‑ligand | single batched process | speed‑up |
-|--------:|-----------------------:|-----------------------:|---------:|
-| 3       | 114 s                  | 43 s                   | 2.6×     |
-| 10      | ~380 s                 | ~61 s                  | ~6×      |
-| 100     | ~63 min                | ~5 min                 | ~13×     |
+| receptor | MSA | sampling | ligands | per‑process | batched | speed‑up |
+|---|---|---|--:|--:|--:|--:|
+| 117 aa | none | 20/20 steps | 3 | 114 s | 43 s | 2.7× |
+| 384 aa | real (cached) | 100/100 steps, recycle 2 | 6 | 281 s | 93 s | 3.0× |
 
-The per‑ligand fixed overhead removed is roughly constant (~35 s here), so the
-speed‑up grows with the number of ligands and asymptotes at
-`(load + compute) / compute`.
+The per‑ligand fixed overhead removed is ~36–38 s in every run (process start +
+`import torch` + both checkpoints → GPU). It is independent of the ligand count,
+so the speed‑up grows with N and asymptotes at `(load + compute) / compute`
+(≈5× for the 384 aa case, ≈15× for the tiny one). Extrapolated:
+
+| ligands | 117 aa | 384 aa |
+|--:|--:|--:|
+| 10 | ~6× | ~4× |
+| 100 | ~13× | ~5× |
 
 ## Usage
 
@@ -40,8 +45,20 @@ python scripts/batch_predict.py \
 Each ligand becomes `protein (chain A) + ligand (chain B)` with
 `properties: [{affinity: {binder: B}}]` (drop with `--no-affinity`).
 
-Results land under `runs/screen1/batch/rep0/out/boltz_results_inputs/predictions/<ligNNNN>/`
-plus a machine‑readable `runs/screen1/benchmark.json`.
+Results land under `runs/screen1/batch/rep0/out/boltz_results_inputs/predictions/<ligNNNN>/`,
+plus two machine‑readable files at the root of `--out`:
+
+* **`results.json`** — one row per ligand, **written even if the run crashed
+  partway**: `{index, smiles, stem, status, confidence, affinity}` where `status`
+  is `completed` / `structure_only` (structure done, affinity missing) /
+  `failed`. `boltz predict` writes each record's outputs as it finishes, so a
+  mid‑run OOM / RDKit abort / kill keeps every ligand computed so far.
+* **`benchmark.json`** — timings, the batch‑size decision, OOM‑retry attempts,
+  reproducibility flags, and the same per‑ligand rows.
+
+`--skip_bad_inputs` is passed to `boltz` by default (one bad SMILES is skipped,
+not fatal — `--abort-on-bad-input` to opt out). `--resume` re‑runs a `--out`
+directory and computes only the ligands still missing.
 
 ### MSA
 
