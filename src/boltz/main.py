@@ -1304,6 +1304,17 @@ def _parse_devices(value: str) -> Union[int, List[int]]:
     default=5,
 )
 @click.option(
+    "--recycling_steps_affinity",
+    type=int,
+    default=5,
+    help=(
+        "Trunk recycling steps for the affinity phase (upstream hardcodes 5). "
+        "Lowering to 2-3 speeds up affinity screening at some accuracy cost; "
+        "affinity_probability_binary is more robust to this than "
+        "affinity_pred_value."
+    ),
+)
+@click.option(
     "--affinity_checkpoint",
     type=click.Path(exists=True),
     help="An optional checkpoint, will use the provided Boltz-1 model by default.",
@@ -1382,6 +1393,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     sampling_steps: int,
     diffusion_samples: int,
     sampling_steps_affinity: int,
+    recycling_steps_affinity: int,
     diffusion_samples_affinity: int,
     max_parallel_samples: Optional[int],
     step_scale: Optional[float],
@@ -1845,7 +1857,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         )
 
         predict_affinity_args = {
-            "recycling_steps": 5,
+            "recycling_steps": recycling_steps_affinity,
             "sampling_steps": sampling_steps_affinity,
             "diffusion_samples": diffusion_samples_affinity,
             "max_parallel_samples": _resolve_affinity_max_parallel_samples(
