@@ -234,15 +234,27 @@ def auto_batch_size(n_tokens: int, n_ligs: int, free_gb: float | None, cap: int)
 # ---------------------------------------------------------------------------
 # running boltz
 # ---------------------------------------------------------------------------
-def boltz_cmd(data: Path, out_dir: Path, seed: int, extra: list[str], batch_size: int) -> list[str]:
-    return [
+def boltz_cmd(
+    data: Path,
+    out_dir: Path,
+    seed: int,
+    extra: list[str],
+    batch_size: int,
+    *,
+    override: bool = True,
+    skip_bad: bool = True,
+) -> list[str]:
+    cmd = [
         boltz_bin(), "predict", str(data),
         "--out_dir", str(out_dir),
         "--seed", str(seed),
-        "--override",
         "--batch_size", str(batch_size),
-        *extra,
     ]
+    if override:
+        cmd.append("--override")
+    if skip_bad:
+        cmd.append("--skip_bad_inputs")  # one bad ligand must not abort the rest
+    return cmd + extra
 
 
 def run(cmd: list[str], log: Path) -> tuple[float, int]:
@@ -287,9 +299,51 @@ def collect(out_dir: Path) -> dict[str, dict]:
 
 def collect_many(root: Path) -> dict[str, dict]:
     merged: dict[str, dict] = {}
+    if not root.exists():
+        return merged
     for sub in sorted(p for p in root.iterdir() if p.is_dir()):
         merged.update(collect(sub))
     return merged
+
+
+def full_affinity(out_dir: Path, stem: str) -> dict | None:
+    """The complete affinity_*.json for one record (all fields), or None.
+
+    ``**`` so it works for both the batch layout (out/boltz_results_inputs/...)
+    and the single layout (rep0/<stem>/boltz_results_<stem>/...).
+    """
+    for f in out_dir.glob(f"**/predictions/{stem}/affinity_*.json"):
+        try:
+            return json.loads(f.read_text())
+        except (OSError, json.JSONDecodeError):
+            return None
+    return None
+
+
+def screen_results(
+    ligands: list[str], stems: list[str], out_dir: Path, results: dict[str, dict], want_affinity: bool
+) -> list[dict]:
+    """Per-ligand status, always computable from whatever landed on disk."""
+    rows = []
+    for i, (smi, stem) in enumerate(zip(ligands, stems)):
+        entry = results.get(stem, {})
+        has_struct = "cif_sha256" in entry
+        has_aff = "affinity" in entry
+        if has_struct and (has_aff or not want_affinity):
+            status = "completed"
+        elif has_struct:
+            status = "structure_only"  # affinity requested but missing
+        else:
+            status = "failed"
+        rows.append({
+            "index": i,
+            "smiles": smi,
+            "stem": stem,
+            "status": status,
+            "confidence": entry.get("confidence"),
+            "affinity": full_affinity(out_dir, stem) if has_aff else None,
+        })
+    return rows
 
 
 def diff_numbers(a: dict, b: dict) -> float:
@@ -305,12 +359,18 @@ def diff_numbers(a: dict, b: dict) -> float:
 # ---------------------------------------------------------------------------
 # modes
 # ---------------------------------------------------------------------------
-def run_single(yamls: list[Path], root: Path, seed: int, extra: list[str], rep: int) -> dict:
+def run_single(
+    yamls: list[Path], root: Path, seed: int, extra: list[str], rep: int,
+    *, override: bool, skip_bad: bool = True,
+) -> dict:
     per: dict[str, float] = {}
     t0 = time.perf_counter()
     for y in yamls:
         out_dir = root / f"rep{rep}" / y.stem
-        wall, rc = run(boltz_cmd(y, out_dir, seed, extra, 1), out_dir / "boltz.log")
+        wall, rc = run(
+            boltz_cmd(y, out_dir, seed, extra, 1, override=override, skip_bad=skip_bad),
+            out_dir / "boltz.log",
+        )
         per[y.stem] = wall
         print(f"[single rep{rep}] {y.stem}: {wall:7.1f}s  {'ok' if rc == 0 else f'FAIL(rc={rc})'}", flush=True)
     return {
@@ -328,6 +388,9 @@ def run_batch(
     batch_size: int,
     rep: int,
     oom_fallback: bool,
+    *,
+    override: bool = True,
+    skip_bad: bool = True,
 ) -> dict:
     in_dir = root / f"rep{rep}" / "inputs"
     in_dir.mkdir(parents=True, exist_ok=True)
@@ -338,16 +401,18 @@ def run_batch(
 
     bs = max(1, min(batch_size, len(yamls)))
     attempts: list[dict] = []
+    ovr = override
     t0 = time.perf_counter()
     while True:
-        wall, rc = run(boltz_cmd(in_dir, out_dir, seed, extra, bs), log)
+        wall, rc = run(boltz_cmd(in_dir, out_dir, seed, extra, bs, override=ovr, skip_bad=skip_bad), log)
         oom = rc != 0 and bool(OOM_RE.search(log.read_text(errors="replace")))
         attempts.append({"batch_size": bs, "wall_s": round(wall, 1), "rc": rc, "oom": oom})
         tag = "ok" if rc == 0 else ("OOM" if oom else f"FAIL(rc={rc})")
         print(f"[batch  rep{rep}] {len(yamls)} ligands @ bs={bs}: {wall:7.1f}s  {tag}", flush=True)
         if oom and oom_fallback and bs > 1:
             bs = max(1, bs // 2)
-            print(f"[batch  rep{rep}] -> retry at batch_size={bs}", flush=True)
+            ovr = False  # keep records already written before the OOM; resume the rest
+            print(f"[batch  rep{rep}] -> retry at batch_size={bs} (resuming)", flush=True)
             continue
         break
 
@@ -444,6 +509,12 @@ def main() -> None:
     ap.add_argument("--boltz-arg", action="append", default=[],
                     help="extra arg for boltz predict, repeatable, use = form: --boltz-arg=--sampling_steps=50")
     ap.add_argument("--check-repro", action="store_true", help="run each mode twice and assert identical")
+    ap.add_argument("--resume", action="store_true",
+                    help="keep predictions already on disk in --out and only compute what is missing "
+                    "(drops boltz --override)")
+    ap.add_argument("--abort-on-bad-input", action="store_true",
+                    help="abort the whole run if any ligand fails preprocessing "
+                    "(default: skip it and keep going)")
     ap.add_argument(
         "--deterministic",
         action="store_true",
@@ -502,14 +573,23 @@ def main() -> None:
         "extra_args": extra,
     }
 
+    override = not args.resume
+    skip_bad = not args.abort_on_bad_input
+    bench["resume"] = args.resume
+    bench["skip_bad_inputs"] = skip_bad
+
     single_runs, batch_runs = [], []
     for rep in range(reps):
         if args.mode in ("both", "single"):
-            single_runs.append(run_single(yamls, args.out / "single", args.seed, extra, rep))
+            single_runs.append(run_single(
+                yamls, args.out / "single", args.seed, extra, rep,
+                override=override, skip_bad=skip_bad,
+            ))
         if args.mode in ("both", "batch"):
-            batch_runs.append(
-                run_batch(yamls, args.out / "batch", args.seed, extra, bs, rep, not args.no_oom_fallback)
-            )
+            batch_runs.append(run_batch(
+                yamls, args.out / "batch", args.seed, extra, bs, rep, not args.no_oom_fallback,
+                override=override, skip_bad=skip_bad,
+            ))
 
     if args.check_repro:
         print("\nreproducibility check (same seed, 2 runs):")
@@ -532,8 +612,27 @@ def main() -> None:
     if s0:
         bench["single_per_ligand_s"] = {k: round(v, 1) for k, v in s0["per_ligand_s"].items()}
 
+    # ---- per-ligand deliverable, written even if a run crashed partway ----
+    stems = [y.stem for y in yamls]
+    if b0 is not None:
+        prod_out, prod_res = args.out / "batch" / "rep0" / "out", b0["results"]
+    else:
+        prod_out = args.out / "single" / "rep0"
+        prod_res = collect_many(prod_out)
+    rows = screen_results(ligands, stems, prod_out, prod_res, args.affinity)
+    done = sum(r["status"] == "completed" for r in rows)
+    bench["completed"] = done
+    bench["results"] = rows
+    (args.out / "results.json").write_text(json.dumps(
+        {"receptor_len": len(seq), "n_ligands": len(rows), "completed": done,
+         "seed": args.seed, "affinity": args.affinity, "results": rows},
+        indent=2,
+    ))
     (args.out / "benchmark.json").write_text(json.dumps(bench, indent=2))
-    print(f"\nwrote {args.out / 'benchmark.json'}")
+    print(f"\ncompleted {done}/{len(rows)} ligands  "
+          f"({sum(r['status'] == 'structure_only' for r in rows)} structure-only, "
+          f"{sum(r['status'] == 'failed' for r in rows)} failed)")
+    print(f"wrote {args.out / 'results.json'} and {args.out / 'benchmark.json'}")
 
 
 if __name__ == "__main__":
