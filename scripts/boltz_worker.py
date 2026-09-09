@@ -311,8 +311,14 @@ def main() -> None:
     )
     args = ap.parse_args()
 
-    worker = Worker(args.cache, no_kernels=args.no_kernels, flash_attn=args.flash_attn)
-    print(json.dumps({"status": "ready", "idle_timeout_s": args.idle_timeout}), flush=True)
+    # stdout is the protocol channel (one JSON object per line). Everything boltz
+    # / Lightning / tqdm prints must not land there -> send it to stderr.
+    import contextlib
+
+    proto = sys.stdout
+    with contextlib.redirect_stdout(sys.stderr):
+        worker = Worker(args.cache, no_kernels=args.no_kernels, flash_attn=args.flash_attn)
+    print(json.dumps({"status": "ready", "idle_timeout_s": args.idle_timeout}), file=proto, flush=True)
 
     while True:
         # Block for a request, but no longer than the idle timeout. When it
@@ -323,7 +329,7 @@ def main() -> None:
             ready, _, _ = select.select([sys.stdin], [], [], args.idle_timeout)
             if not ready:
                 log(f"[worker] idle {args.idle_timeout:.0f}s, shutting down (releasing VRAM)")
-                print(json.dumps({"status": "idle_shutdown"}), flush=True)
+                print(json.dumps({"status": "idle_shutdown"}), file=proto, flush=True)
                 return
         line = sys.stdin.readline()
         if not line:  # stdin closed
@@ -335,25 +341,26 @@ def main() -> None:
         try:
             req = json.loads(line)
         except json.JSONDecodeError as e:
-            print(json.dumps({"status": "error", "error": f"bad json: {e}"}), flush=True)
+            print(json.dumps({"status": "error", "error": f"bad json: {e}"}), file=proto, flush=True)
             continue
         rid = req.get("id")
         t0 = time.perf_counter()
         n_cached = len(worker._models)
         try:
-            res = worker.handle(req)
+            with contextlib.redirect_stdout(sys.stderr):
+                res = worker.handle(req)
             print(json.dumps({
                 "id": rid, "status": "ok",
                 "elapsed_s": round(time.perf_counter() - t0, 2),
                 "model_cache": "hit" if len(worker._models) == n_cached else "miss",
                 **res,
-            }), flush=True)
+            }), file=proto, flush=True)
         except Exception as e:  # noqa: BLE001
             log(traceback.format_exc())
             print(json.dumps({
                 "id": rid, "status": "error", "error": str(e),
                 "elapsed_s": round(time.perf_counter() - t0, 2),
-            }), flush=True)
+            }), file=proto, flush=True)
 
 
 if __name__ == "__main__":
