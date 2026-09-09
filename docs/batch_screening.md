@@ -161,3 +161,41 @@ cross‑mode agreement table. `--mode single` / `--mode batch` run just one.
 - **Two boltz processes on one GPU is slower** (160 s vs 149 s for 20 ligands) —
   a single process already saturates the card; a second just adds context-switch
   overhead. Multi-process only helps across multiple GPUs.
+
+## Affinity recycling (`--recycling_steps_affinity`)
+
+Upstream hardcodes the affinity trunk to 5 recycling steps; this fork exposes it.
+Measured (20 ligands, 384 aa, `--screen`, vs steps=5):
+
+| steps | wall | prob_binary Δ (mean / max) | pred_value Δ (mean / max) |
+|--:|--:|--|--|
+| 5 | 144 s | — | — |
+| 3 | 136 s (-5%) | 0.020 / 0.071 | 0.15 / 0.35 |
+| 1 | 127 s (-12%) | 0.033 / 0.085 | 0.21 / 0.61 |
+
+`--boltz-arg=--recycling_steps_affinity=3` is a reasonable further cut if you rank
+on `affinity_probability_binary` (mean shift ~0.02); `affinity_pred_value`
+(log10 IC50) drifts more, so keep 5 if that number matters. Not included in
+`--screen` by default.
+
+## Where the time goes, and what's left
+
+At `--screen` settings the per-ligand compute is ~5.2 s (384 aa receptor), split
+fairly evenly between the structure and affinity forwards; there is no single
+dominant term left to cut with flags. Config tuning tops out around 10–15% over
+the already-lean `--screen` baseline (TF32 ~6%, affinity recycling ~5%).
+
+Further speed-up needs one of:
+
+* **Batched affinity** — run N pocket-crop affinity forwards together instead of
+  serially. The affinity crop is small (~pocket only), so unlike the
+  full-receptor structure forward it may not saturate the GPU at batch 1, i.e.
+  there may be real headroom. Needs `BoltzAffinityWriter` (indexes `[0]` /
+  `.item()`), the affinity forward, and the datamodule collate audited for
+  `batch_size>1`; gate behind `--batch_size_affinity` and run the regression
+  suite. Estimated up to ~1.5–1.7× on an affinity-heavy 100-ligand batch **if**
+  the headroom is real.
+* **Trunk / MSA-module reuse across ligands** for a fixed receptor — research
+  effort, big for large same-receptor campaigns.
+* **A second GPU** — `--devices 0,1` shards records across cards, near-linear;
+  multi-process on *one* card does not help (measured).
