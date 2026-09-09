@@ -1486,16 +1486,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
                 "(records sharing a forward pass cannot be reseeded individually)."
             )
             batch_size = 1
-        # Pin algorithm selection too, so a record's result does not depend on
-        # what ran before it in the same process (cuBLAS/cuDNN pick algos by
-        # timing otherwise). warn_only: ops without a deterministic kernel warn
-        # instead of raising.
-        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
         torch.backends.cudnn.benchmark = False
-        try:
-            torch.use_deterministic_algorithms(True, warn_only=True)
-        except Exception as exc:  # noqa: BLE001
-            click.echo(f"--deterministic_per_record: could not enable deterministic algorithms ({exc}).")
 
     class _PerRecordReseed(Callback):
         """Reset the global torch RNG to a fixed seed before every predict batch."""

@@ -111,15 +111,23 @@ recorded in `benchmark.json` under `batch_attempts`.
 
 `scripts/batch_predict.py --deterministic` (or `boltz predict
 --deterministic_per_record --seed S` directly) re‑seeds the global RNG to `S`
-before every record and before the affinity phase, so a record's prediction
-depends only on its own inputs and the seed — not on its position in the batch
-or on how many records ran first. A batched run then reproduces a
-one‑record‑at‑a‑time run element‑wise.
+before every record and before the affinity phase and disables cuDNN
+autotuning, so a record no longer inherits the RNG stream left by the records
+before it.
 
-Cost: it forces structure `batch_size=1`, giving up the intra‑forward batching
-speed‑up (the load‑amortisation speed‑up is unaffected). Use it for validation
-and for runs whose numbers must be quotable against a single‑ligand rerun; leave
-it off for throughput screening.
+Measured effect (117 aa, 3 ligands, seed 42): cross‑mode `affinity_pred_value`
+disagreement drops from ~0.05–0.17 to **~0.0–0.08** (one ligand matched
+exactly), and `affinity_probability_binary` — the binder/decoy score you rank
+on — stays within ~0.01 either way. A small residual remains: `boltz` runs the
+structure phase over all records before the affinity phase, and some GPU
+reductions are not bit‑reproducible across different execution histories in one
+process. So this tightens agreement, it does not guarantee bit‑identity.
+
+Cost: forces structure `batch_size=1`, giving up the intra‑forward batching
+speed‑up (the load‑amortisation speed‑up is unaffected). Use it when a batched
+number must line up with a single‑ligand rerun; leave it off for throughput
+screening, where the batched numbers are already self‑consistent and fully
+reproducible run‑to‑run.
 
 ## Benchmark mode
 
