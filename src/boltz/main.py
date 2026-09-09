@@ -1358,6 +1358,18 @@ def _parse_devices(value: str) -> Union[int, List[int]]:
         "element-wise. Forces structure batch_size=1 and requires --seed."
     ),
 )
+@click.option(
+    "--matmul_precision",
+    type=click.Choice(["highest", "high", "medium"]),
+    default="highest",
+    help=(
+        "torch.set_float32_matmul_precision. 'highest' (default) keeps full fp32 "
+        "matmuls; 'high'/'medium' enable TF32 / bf16 for fp32 matmuls, a small "
+        "speed-up on the residual fp32 ops (structure/affinity trunk runs "
+        "bf16-mixed already, so the effect is modest). 'high' is a safe screening "
+        "default."
+    ),
+)
 def predict(  # noqa: C901, PLR0915, PLR0912
     data: str,
     out_dir: str,
@@ -1400,6 +1412,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     flash_attn: bool,
     write_embeddings: bool,
     deterministic_per_record: bool,
+    matmul_precision: str,
 ) -> None:
     """Run predictions with Boltz."""
     import torch
@@ -1467,7 +1480,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     torch.set_grad_enabled(False)
 
     # Ignore matmul precision warning
-    torch.set_float32_matmul_precision("highest")
+    torch.set_float32_matmul_precision(matmul_precision)
 
     # Set rdkit pickle logic
     Chem.SetDefaultPickleProperties(Chem.PropertyPickleOptions.AllProps)

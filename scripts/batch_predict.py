@@ -508,6 +508,11 @@ def main() -> None:
     ap.add_argument("--msa-server-url", default="https://api.colabfold.com")
     ap.add_argument("--boltz-arg", action="append", default=[],
                     help="extra arg for boltz predict, repeatable, use = form: --boltz-arg=--sampling_steps=50")
+    ap.add_argument("--screen", action="store_true",
+                    help="fast screening preset: recycling 1, sampling 50, 1 diffusion sample, "
+                    "affinity 50 steps / 1 sample, TF32 matmul, skip full pae/pde npz. "
+                    "Your own --boltz-arg values override individual settings.")
+    ap.add_argument("--flash-attn", action="store_true", help="pass boltz --flash_attn (SDPA/FA2)")
     ap.add_argument("--check-repro", action="store_true", help="run each mode twice and assert identical")
     ap.add_argument("--resume", action="store_true",
                     help="keep predictions already on disk in --out and only compute what is missing "
@@ -555,7 +560,17 @@ def main() -> None:
         bs, why = auto_batch_size(n_tokens, len(yamls), free_gb, args.max_batch_size)
     print(f"[batch-size] {why}")
 
-    extra = list(args.boltz_arg)
+    # preset first, user --boltz-arg last so it wins; --flash_attn / --deterministic appended
+    preset: list[str] = []
+    if args.screen:
+        preset = [
+            "--recycling_steps=1", "--sampling_steps=50", "--diffusion_samples=1",
+            "--sampling_steps_affinity=50", "--diffusion_samples_affinity=1",
+            "--matmul_precision=high", "--no_write_full_pae", "--no_write_full_pde",
+        ]
+    extra = preset + list(args.boltz_arg)
+    if args.flash_attn:
+        extra.append("--flash_attn")
     if args.deterministic:
         extra.append("--deterministic_per_record")
     reps = 2 if args.check_repro else 1
