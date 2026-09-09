@@ -441,6 +441,152 @@ async def _run_mock(job_id: str, yaml_path: Path, out_dir: Path) -> None:
 # Endpoints
 # ---------------------------------------------------------------------------
 
+_HELP = {
+    "service": "Boltz-2 predict API",
+    "overview": (
+        "POST a TOML prediction request; it is queued and run by a worker pool "
+        "(default 1 -> strict serial, since one GPU cannot run two boltz "
+        "predictions at once). Poll the job until it is 'completed', then GET "
+        "its result. One request = one boltz run = one output complex (which "
+        "may contain several chains). To screen many ligands, submit many "
+        "requests (see 'screening_many_ligands')."
+    ),
+    "interactive_docs": "GET /docs  (Swagger UI, full request/response schema)",
+    "endpoints": {
+        "POST /predict": {
+            "body": {
+                "toml": "string, required -- the prediction spec, see 'toml_format'",
+                "extra_args": "string, optional -- extra flags passed verbatim to `boltz predict` "
+                              "(e.g. '--recycling_steps 1 --sampling_steps 50 --diffusion_samples_affinity 1')",
+            },
+            "returns": "202  {job_id, status:'pending', msa_cache_hits, queue_position}",
+            "errors": "422 if the TOML does not parse",
+        },
+        "GET /jobs/{job_id}": {
+            "returns": "{job_id, status, msa_cache_hits, created_at, updated_at, "
+                       "queue_position (while pending), error (if failed)}",
+            "status_values": ["pending", "running", "completed", "failed", "cancelled"],
+        },
+        "GET /jobs/{job_id}/result": {
+            "returns": "{job_id, structures:{<record>: <mmCIF text>}, "
+                       "confidence:{<record>: {...}}, affinity:{<record>: {...}}}",
+            "errors": "409 if not finished yet, 422 if the job failed, 404 if unknown",
+        },
+        "POST /jobs/{job_id}/cancel": {
+            "effect": "drops a job that is still 'pending' (returns 409 once it is running)",
+            "returns": "{job_id, status:'cancelled'}",
+        },
+        "GET /jobs?limit=N": "recent jobs (default 20), same shape as GET /jobs/{id}",
+        "GET /queue": "{workers, running:[job_id...], pending:[job_id...]}",
+        "GET /msa/cache": "{cache_dir, entries, files} -- sequences currently cached",
+        "GET /health": "{status, mock, msa_cache_dir, workers, running, queued, gpu_lock}",
+        "GET /help": "this document",
+    },
+    "polling": (
+        "After POST /predict, poll GET /jobs/{job_id} every ~10 s. While "
+        "'pending', queue_position tells you how many jobs are ahead. Fetch "
+        "GET /jobs/{job_id}/result once status is 'completed'."
+    ),
+    "toml_format": {
+        "note": "Mirrors the boltz YAML schema. See GET /docs and docs/prediction.md.",
+        "minimal": (
+            "version = 1\n\n"
+            '[[sequences]]\n'
+            'protein.id = "A"\n'
+            'protein.sequence = "MVTPEG..."\n\n'
+            '[[sequences]]\n'
+            'ligand.id = "B"\n'
+            'ligand.smiles = "CCO"\n\n'
+            '[[properties]]\n'
+            'affinity.binder = "B"\n'
+        ),
+        "fields": {
+            "[[sequences]] protein": "protein.id, protein.sequence; optional protein.msa (path) "
+                                     "or protein.msa_content (raw A3M text, saved to the cache); "
+                                     "protein.cyclic = true",
+            "[[sequences]] ligand": "ligand.id + one of ligand.smiles / ligand.ccd",
+            "[[properties]] affinity": "affinity.binder = <ligand chain id>. Boltz-2 supports "
+                                       "exactly ONE affinity binder per request.",
+            "[[templates]]": 'cif = "placeholder" (or pdb=...) + content = """<file text>""" + template_id',
+            "[[constraints]]": "pocket / bond / contact -- see docs/prediction.md",
+        },
+    },
+    "msa": {
+        "cache_dir": str(MSA_CACHE_DIR),
+        "key": "sha256(uppercase stripped sequence)[:24]",
+        "hit": "the cached MSA path is injected into the YAML; no MSA server call",
+        "miss": "the server adds --use_msa_server; the generated CSV is saved to the cache after a "
+                "successful run, so the next request for that sequence is a hit",
+        "seed_it_yourself": "put raw A3M in protein.msa_content to prime the cache without a server call",
+    },
+    "screening_many_ligands": {
+        "one_complex_vs_many_jobs": (
+            "Putting several ligand [[sequences]] blocks in ONE toml cofolds them "
+            "together as a single complex (and you still get at most one affinity "
+            "value). For a screen -- N ligands each scored against the same "
+            "receptor -- submit N separate POST /predict requests, each with the "
+            "receptor + one ligand + its own affinity.binder."
+        ),
+        "recipe": [
+            "1. Warm the receptor MSA once: submit the first ligand (or any job "
+            "with that receptor). After it finishes the MSA is cached, so every "
+            "later request for the same receptor is a cache hit (no ~60 s MSA "
+            "fetch).",
+            "2. Submit the remaining ligands. They queue behind each other and "
+            "run one at a time; each response carries queue_position.",
+            "3. Poll GET /queue (or each GET /jobs/{id}) until all are "
+            "'completed'/'failed', then collect GET /jobs/{id}/result.",
+            "4. A failed ligand does not block the rest -- its job goes 'failed' "
+            "and the queue moves on.",
+        ],
+        "fast_screening_flags": (
+            "pass via extra_args: '--recycling_steps 1 --sampling_steps 50 "
+            "--diffusion_samples 1 --sampling_steps_affinity 50 "
+            "--diffusion_samples_affinity 1 --recycling_steps_affinity 3 "
+            "--matmul_precision high --no_write_full_pae --no_write_full_pde'. "
+            "Measured ~5 s/ligand on an RTX 5090 (384 aa receptor) vs ~17 s with "
+            "defaults; accuracy drops modestly -- use as a first-pass filter."
+        ),
+        "local_cli": (
+            "scripts/batch_predict.py does this end to end against a local "
+            "`boltz predict` (not this server): one receptor + a SMILES list -> "
+            "one process, per-ligand results.json kept even on a crash, "
+            "--resume, auto batch size, OOM fallback. See docs/batch_screening.md. "
+            "It is faster than N requests here because a single `boltz predict` "
+            "over a directory loads the model once; this server reloads per job "
+            "unless BOLTZ_MAX_CONCURRENCY workers stay warm."
+        ),
+        "timing_note": (
+            "10 ligands / 384 aa / fast flags, measured: N separate `boltz "
+            "predict` = 429 s; one batched `boltz predict <dir>` = 95 s; a warm "
+            "resident worker fed one at a time = 131 s (10 s/ligand after the "
+            "first). Batch wins when you have all ligands up front; a warm "
+            "worker wins when ligands arrive over time."
+        ),
+    },
+    "concurrency": {
+        "BOLTZ_MAX_CONCURRENCY": "worker pool size (default 1 = serial). >1 only with real GPU "
+                                 "headroom or per-worker device isolation.",
+        "BOLTZ_WORKER_DEVICES": "comma-separated CUDA_VISIBLE_DEVICES per worker slot (e.g. '0,1' "
+                                "or H100 MIG instance UUIDs); slot i uses entry i.",
+        "BOLTZ_GPU_LOCK": "path to an advisory flock held around each boltz subprocess so other "
+                          "GPU users (batch_predict.py, MD jobs) serialize too. Unneeded with MIG.",
+        "BOLTZ_MOCK": "1 -> fake ~3 s results, no GPU (for testing).",
+        "BOLTZ_MSA_CACHE": "override the MSA cache directory.",
+    },
+}
+
+
+@app.get("/help")
+def help_doc():
+    return _HELP
+
+
+@app.get("/")
+def root():
+    return {"service": "Boltz-2 predict API", "help": "GET /help", "docs": "GET /docs"}
+
+
 @app.post("/predict", status_code=202)
 async def predict(req: PredictRequest):
     job_id = uuid.uuid4().hex
