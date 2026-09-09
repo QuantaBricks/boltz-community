@@ -344,6 +344,18 @@ class TestSkipBadInputsClickOption:
         pytest.fail("skip_bad_inputs parameter not found on predict command")
 
 
+class TestDeterministicPerRecordClickOption:
+    """The --deterministic_per_record CLI option exists and defaults to False."""
+
+    def test_option_exists_and_defaults_false(self):
+        for param in predict.params:
+            if param.name == "deterministic_per_record":
+                assert param.default is False
+                assert param.is_flag
+                return
+        pytest.fail("deterministic_per_record parameter not found on predict command")
+
+
 class TestAffinityMaxParallelSamples:
     """Affinity diffusion honors the user's --max_parallel_samples.
 

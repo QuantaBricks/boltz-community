@@ -1347,6 +1347,17 @@ def _parse_devices(value: str) -> Union[int, List[int]]:
     is_flag=True,
     help="Whether to dump the s and z embeddings into a npz file.",
 )
+@click.option(
+    "--deterministic_per_record",
+    is_flag=True,
+    help=(
+        "Re-seed the global RNG to --seed before every record and before the "
+        "affinity phase, so a record's prediction depends only on its own inputs "
+        "and the seed -- not on its position in the batch or on how many records "
+        "ran before it. Makes a batched run reproduce a one-record-at-a-time run "
+        "element-wise. Forces structure batch_size=1 and requires --seed."
+    ),
+)
 def predict(  # noqa: C901, PLR0915, PLR0912
     data: str,
     out_dir: str,
@@ -1388,10 +1399,11 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     no_kernels: bool,
     flash_attn: bool,
     write_embeddings: bool,
+    deterministic_per_record: bool,
 ) -> None:
     """Run predictions with Boltz."""
     import torch
-    from pytorch_lightning import Trainer, seed_everything
+    from pytorch_lightning import Callback, Trainer, seed_everything
     from pytorch_lightning.strategies import DDPStrategy
     from rdkit import Chem
 
@@ -1463,6 +1475,38 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     # Set seed if desired
     if seed is not None:
         seed_everything(seed)
+
+    if deterministic_per_record:
+        if seed is None:
+            msg = "--deterministic_per_record requires --seed."
+            raise click.UsageError(msg)
+        if batch_size != 1:
+            click.echo(
+                "--deterministic_per_record: forcing structure batch_size=1 "
+                "(records sharing a forward pass cannot be reseeded individually)."
+            )
+            batch_size = 1
+        # Pin algorithm selection too, so a record's result does not depend on
+        # what ran before it in the same process (cuBLAS/cuDNN pick algos by
+        # timing otherwise). warn_only: ops without a deterministic kernel warn
+        # instead of raising.
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.backends.cudnn.benchmark = False
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except Exception as exc:  # noqa: BLE001
+            click.echo(f"--deterministic_per_record: could not enable deterministic algorithms ({exc}).")
+
+    class _PerRecordReseed(Callback):
+        """Reset the global torch RNG to a fixed seed before every predict batch."""
+
+        def __init__(self, seed_value: int) -> None:
+            self._seed = seed_value
+
+        def on_predict_batch_start(self, *args: object, **kwargs: object) -> None:
+            torch.manual_seed(self._seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(self._seed)
 
     for key in ["CUEQ_DEFAULT_CONFIG", "CUEQ_DISABLE_AOT_TUNING"]:
         # Disable kernel tuning by default,
@@ -1639,10 +1683,15 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         precision = "bf16-mixed"
 
     # Set up trainer
+    trainer_callbacks = [pred_writer]
+    if deterministic_per_record:
+        # Index 0 stays the writer (the affinity phase does `callbacks[0] = ...`);
+        # the reseed callback rides along for both phases.
+        trainer_callbacks.append(_PerRecordReseed(seed))
     trainer = Trainer(
         default_root_dir=out_dir,
         strategy=strategy,
-        callbacks=[pred_writer],
+        callbacks=trainer_callbacks,
         accelerator=accelerator,
         devices=devices,
         precision=precision,
