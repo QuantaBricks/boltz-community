@@ -44,10 +44,26 @@ Hit  → injects `msa: <cache_path>` into the YAML; no server call needed.
 Miss → adds --use_msa_server; after a successful run the generated CSV is
        saved to cache automatically.
 
+## Queue
+
+Jobs are queued and drained by a worker pool (default size 1 = strict serial;
+one GPU cannot run two boltz predictions at once). POST /predict returns
+immediately with status "pending" and a queue_position. Poll GET /jobs/{id}
+(status pending->running->completed/failed, plus queue_position while pending).
+POST /jobs/{id}/cancel drops a still-pending job. GET /queue and GET /health
+show running/pending.
+
 ## Environment variables
 
-  BOLTZ_MOCK=1          Return fake results (~3 s) without a GPU.
-  BOLTZ_MSA_CACHE=path  Override MSA cache directory.
+  BOLTZ_MOCK=1            Return fake results (~3 s) without a GPU.
+  BOLTZ_MSA_CACHE=path    Override MSA cache directory.
+  BOLTZ_MAX_CONCURRENCY=N Worker pool size (default 1). >1 only with real GPU
+                         headroom or per-worker device pinning.
+  BOLTZ_WORKER_DEVICES=.. Comma-separated CUDA_VISIBLE_DEVICES per worker slot
+                         (e.g. "0,1" or MIG UUIDs); slot i uses entry i.
+  BOLTZ_GPU_LOCK=path     Advisory flock held around each boltz subprocess so
+                         other GPU users (batch_predict.py, MD) serialize too.
+                         Unnecessary with MIG isolation.
 
 ## Usage
 
@@ -66,6 +82,7 @@ import shutil
 import sys
 import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import uvicorn
@@ -92,9 +109,130 @@ JOBS_DIR.mkdir(exist_ok=True)
 MSA_CACHE_DIR = Path(os.environ.get("BOLTZ_MSA_CACHE", Path.home() / ".boltz" / "msa_cache"))
 MSA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="Boltz Predict API")
+# --- serial execution ------------------------------------------------------
+# One GPU cannot run two boltz predictions at once (measured: slower + 2x VRAM
+# -> OOM). Jobs are queued and drained by a fixed pool of workers. Default pool
+# size 1 = strict serial. Set BOLTZ_MAX_CONCURRENCY>1 only with real GPU
+# headroom or per-worker device pinning (see BOLTZ_WORKER_DEVICES).
+MAX_CONCURRENCY = max(1, int(os.environ.get("BOLTZ_MAX_CONCURRENCY", "1")))
+# Optional per-worker CUDA_VISIBLE_DEVICES, comma-separated (e.g. MIG UUIDs or
+# "0,1"); index i is used by worker i. Empty -> inherit the server's env.
+WORKER_DEVICES = [d for d in os.environ.get("BOLTZ_WORKER_DEVICES", "").split(",") if d]
+# Optional advisory lock path shared with other GPU users (batch_predict.py, MD
+# scripts). When set, a worker flock()s it around the boltz subprocess so
+# unrelated processes serialize too. Pointless with MIG isolation.
+GPU_LOCK_PATH = os.environ.get("BOLTZ_GPU_LOCK") or None
 
 _jobs: dict[str, dict] = {}
+_queue_order: list[str] = []          # pending job_ids, FIFO, for queue_position
+_active: dict[int, str | None] = {}   # worker slot -> job_id it is running
+_workers: list[asyncio.Task] = []
+_wake: asyncio.Event | None = None    # created in lifespan (loop-bound)
+
+
+def _signal() -> None:
+    if _wake is not None:
+        _wake.set()
+
+
+def _public(job: dict) -> dict:
+    """Job dict without internal keys, plus live queue_position."""
+    out = {k: v for k, v in job.items() if not k.startswith("_") and k not in ("log",)}
+    if job.get("status") == "pending":
+        try:
+            out["queue_position"] = _queue_order.index(job["job_id"]) + 1
+        except ValueError:
+            out["queue_position"] = None
+    return out
+
+
+def _flock_blocking(path: str):
+    import fcntl
+
+    fh = open(path, "w")  # noqa: SIM115
+    fcntl.flock(fh, fcntl.LOCK_EX)
+    return fh
+
+
+def _funlock(fh) -> None:
+    import fcntl
+
+    try:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
+    except OSError:
+        pass
+
+
+def _claim_next(slot: int) -> str | None:
+    """Pop the first runnable pending job and mark it running. Runs sync on the
+    event loop, so claim + status flip is atomic against other workers."""
+    taken = set(_active.values())
+    for jid in list(_queue_order):
+        job = _jobs.get(jid)
+        if job is None or job["status"] == "cancelled":
+            _queue_order.remove(jid)
+            continue
+        if job["status"] != "pending" or jid in taken:
+            continue
+        _queue_order.remove(jid)
+        job["status"] = "running"
+        job["updated_at"] = time.time()
+        _active[slot] = jid
+        return jid
+    return None
+
+
+async def _worker(slot: int) -> None:
+    assert _wake is not None
+    while True:
+        job_id = _claim_next(slot)
+        if job_id is None:
+            _wake.clear()
+            await _wake.wait()
+            continue
+        job = _jobs[job_id]
+        try:
+            yaml_path = Path(job["_yaml_path"])
+            out_dir = Path(job["_out_dir"])
+            device = WORKER_DEVICES[slot] if slot < len(WORKER_DEVICES) else None
+            lock_fh = None
+            if GPU_LOCK_PATH and not MOCK:
+                lock_fh = await asyncio.to_thread(_flock_blocking, GPU_LOCK_PATH)
+            try:
+                if MOCK:
+                    await _run_mock(job_id, yaml_path, out_dir)
+                else:
+                    await _run_boltz(
+                        job_id, yaml_path, out_dir, job["_extra_args"], job["_needs_server"], device
+                    )
+            finally:
+                if lock_fh is not None:
+                    await asyncio.to_thread(_funlock, lock_fh)
+        except Exception as exc:  # noqa: BLE001
+            job["status"] = "failed"
+            job["error"] = f"worker error: {exc}"
+            job["updated_at"] = time.time()
+        finally:
+            _active[slot] = None
+            _wake.set()  # re-check for more work
+
+
+@asynccontextmanager
+async def lifespan(_app: "FastAPI"):
+    global _wake
+    _wake = asyncio.Event()
+    for i in range(MAX_CONCURRENCY):
+        _active[i] = None
+        _workers.append(asyncio.create_task(_worker(i)))
+    try:
+        yield
+    finally:
+        for w in _workers:
+            w.cancel()
+
+
+app = FastAPI(title="Boltz Predict API", lifespan=lifespan)
 
 
 class PredictRequest(BaseModel):
@@ -202,7 +340,14 @@ def _prepare_input(toml_str: str, work_dir: Path) -> tuple[Path, bool]:
 # Job runners
 # ---------------------------------------------------------------------------
 
-async def _run_boltz(job_id: str, yaml_path: Path, out_dir: Path, extra_args: str, needs_server: bool) -> None:
+async def _run_boltz(
+    job_id: str,
+    yaml_path: Path,
+    out_dir: Path,
+    extra_args: str,
+    needs_server: bool,
+    device: str | None = None,
+) -> None:
     job = _jobs[job_id]
     job["status"] = "running"
     job["updated_at"] = time.time()
@@ -214,11 +359,16 @@ async def _run_boltz(job_id: str, yaml_path: Path, out_dir: Path, extra_args: st
     if extra_args:
         cmd += extra_args.split()
 
+    env = None
+    if device is not None:
+        env = {**os.environ, "CUDA_VISIBLE_DEVICES": device}
+
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            env=env,
         )
         stdout, _ = await proc.communicate()
         job["log"] = stdout.decode(errors="replace")
@@ -309,18 +459,23 @@ async def predict(req: PredictRequest):
         "job_id": job_id,
         "status": "pending",
         "msa_cache_hits": not needs_server,
-        "work_dir": str(work_dir),
-        "out_dir": str(out_dir),
         "created_at": time.time(),
         "updated_at": time.time(),
+        "_work_dir": str(work_dir),
+        "_out_dir": str(out_dir),
+        "_yaml_path": str(yaml_path),
+        "_extra_args": req.extra_args,
+        "_needs_server": needs_server,
     }
+    _queue_order.append(job_id)
+    _signal()
 
-    if MOCK:
-        asyncio.create_task(_run_mock(job_id, yaml_path, out_dir))
-    else:
-        asyncio.create_task(_run_boltz(job_id, yaml_path, out_dir, req.extra_args, needs_server))
-
-    return {"job_id": job_id, "status": "pending", "msa_cache_hits": not needs_server}
+    return {
+        "job_id": job_id,
+        "status": "pending",
+        "msa_cache_hits": not needs_server,
+        "queue_position": len(_queue_order),
+    }
 
 
 @app.get("/jobs/{job_id}")
@@ -328,7 +483,21 @@ def get_job(job_id: str):
     job = _jobs.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
-    return {k: v for k, v in job.items() if k not in ("work_dir", "out_dir", "log")}
+    return _public(job)
+
+
+@app.post("/jobs/{job_id}/cancel", status_code=200)
+async def cancel_job(job_id: str):
+    job = _jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job["status"] != "pending":
+        raise HTTPException(status_code=409, detail=f"Cannot cancel a job in status '{job['status']}'")
+    job["status"] = "cancelled"
+    job["updated_at"] = time.time()
+    if job_id in _queue_order:
+        _queue_order.remove(job_id)
+    return {"job_id": job_id, "status": "cancelled"}
 
 
 @app.get("/jobs/{job_id}/result")
@@ -341,7 +510,7 @@ def get_result(job_id: str):
     if job["status"] != "completed":
         raise HTTPException(status_code=409, detail=f"Job status: {job['status']}")
 
-    out_dir = Path(job["out_dir"])
+    out_dir = Path(job["_out_dir"])
     result: dict = {"job_id": job_id}
 
     for record_dir in out_dir.glob("boltz_results_*/predictions/*"):
@@ -364,10 +533,7 @@ def get_result(job_id: str):
 
 @app.get("/jobs")
 def list_jobs(limit: int = 20):
-    jobs = [
-        {k: v for k, v in j.items() if k not in ("work_dir", "out_dir", "log")}
-        for j in list(_jobs.values())[-limit:]
-    ]
+    jobs = [_public(j) for j in list(_jobs.values())[-limit:]]
     return {"jobs": jobs, "total": len(_jobs)}
 
 
@@ -380,7 +546,25 @@ def msa_cache_info():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "mock": MOCK, "msa_cache_dir": str(MSA_CACHE_DIR)}
+    running = [jid for jid in _active.values() if jid]
+    return {
+        "status": "ok",
+        "mock": MOCK,
+        "msa_cache_dir": str(MSA_CACHE_DIR),
+        "workers": MAX_CONCURRENCY,
+        "running": running,
+        "queued": len(_queue_order),
+        "gpu_lock": GPU_LOCK_PATH,
+    }
+
+
+@app.get("/queue")
+def queue_state():
+    return {
+        "workers": MAX_CONCURRENCY,
+        "running": [jid for jid in _active.values() if jid],
+        "pending": list(_queue_order),
+    }
 
 
 if __name__ == "__main__":
