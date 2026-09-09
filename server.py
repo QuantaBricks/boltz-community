@@ -122,6 +122,24 @@ WORKER_DEVICES = [d for d in os.environ.get("BOLTZ_WORKER_DEVICES", "").split(",
 # scripts). When set, a worker flock()s it around the boltz subprocess so
 # unrelated processes serialize too. Pointless with MIG isolation.
 GPU_LOCK_PATH = os.environ.get("BOLTZ_GPU_LOCK") or None
+# Keep the Boltz-2 checkpoints resident between jobs via a persistent
+# scripts/boltz_worker.py process that self-exits after this many idle seconds
+# (0 = disabled, the default: every job starts a fresh `boltz predict`). Only
+# used when BOLTZ_MAX_CONCURRENCY == 1. Jobs the warm worker cannot handle
+# (MSA cache miss, templates/constraints, unknown extra_args) transparently
+# fall back to a plain `boltz predict` subprocess.
+KEEP_WARM_SECONDS = int(os.environ.get("BOLTZ_KEEP_WARM_SECONDS", "0"))
+_WARM_OK_FLAGS = {
+    "--recycling_steps": "recycling_steps",
+    "--sampling_steps": "sampling_steps",
+    "--diffusion_samples": "diffusion_samples",
+    "--max_parallel_samples": "max_parallel_samples",
+    "--sampling_steps_affinity": "sampling_steps_affinity",
+    "--diffusion_samples_affinity": "diffusion_samples_affinity",
+    "--recycling_steps_affinity": "recycling_steps_affinity",
+    "--step_scale": "step_scale",
+}
+_WARM_OK_BARE = {"--no_write_full_pae", "--no_write_full_pde"}
 
 _jobs: dict[str, dict] = {}
 _queue_order: list[str] = []          # pending job_ids, FIFO, for queue_position
@@ -164,6 +182,106 @@ def _funlock(fh) -> None:
         pass
 
 
+# --- optional warm worker (keeps checkpoints resident between jobs) --------
+_warm_proc: asyncio.subprocess.Process | None = None
+_warm_lock = asyncio.Lock()
+
+
+def _extra_args_to_req(extra_args: str) -> dict | None:
+    """Translate an `extra_args` string into boltz_worker request fields.
+    Returns None if it contains anything the warm worker does not understand
+    (caller then falls back to a plain `boltz predict` subprocess)."""
+    req: dict = {}
+    toks = extra_args.split()
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        if t in _WARM_OK_BARE:
+            i += 1
+            continue
+        if t in _WARM_OK_FLAGS and i + 1 < len(toks):
+            val = toks[i + 1]
+            req[_WARM_OK_FLAGS[t]] = float(val) if t == "--step_scale" else int(val)
+            i += 2
+            continue
+        if t == "--matmul_precision" and i + 1 < len(toks):
+            i += 2  # worker sets its own; harmless to ignore
+            continue
+        return None  # unknown token -> fall back
+    return req
+
+
+def _yaml_warm_safe(yaml_path: Path) -> bool:
+    try:
+        txt = yaml_path.read_text()
+    except OSError:
+        return False
+    return "templates:" not in txt and "constraints:" not in txt
+
+
+async def _ensure_warm(device: str | None) -> asyncio.subprocess.Process | None:
+    global _warm_proc
+    if _warm_proc is not None and _warm_proc.returncode is None:
+        return _warm_proc
+    env = {**os.environ, "CUDA_VISIBLE_DEVICES": device} if device else None
+    _warm_proc = await asyncio.create_subprocess_exec(
+        sys.executable, str(SERVER_DIR / "scripts" / "boltz_worker.py"),
+        "--cache", str(Path(os.environ.get("BOLTZ_CACHE", Path.home() / ".boltz"))),
+        "--idle-timeout", str(KEEP_WARM_SECONDS),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+        env=env,
+        cwd=str(SERVER_DIR),
+    )
+    try:
+        ready = await asyncio.wait_for(_warm_proc.stdout.readline(), timeout=120)
+        json.loads(ready)  # {"status": "ready", ...}
+    except (asyncio.TimeoutError, ValueError, json.JSONDecodeError):
+        _warm_proc.kill()
+        _warm_proc = None
+    return _warm_proc
+
+
+async def _run_warm(
+    job_id: str, yaml_path: Path, out_dir: Path, extra_args: str, needs_server: bool, device: str | None
+) -> bool:
+    """Run one job through the persistent worker. Returns True if it produced a
+    completed result; False (job status untouched) to fall back."""
+    if needs_server or not _yaml_warm_safe(yaml_path):
+        return False
+    req = _extra_args_to_req(extra_args)
+    if req is None:
+        return False
+
+    async with _warm_lock:
+        proc = await _ensure_warm(device)
+        if proc is None:
+            return False
+        req.update({
+            "id": job_id, "yaml_path": str(yaml_path), "out_dir": str(out_dir),
+            "seed": 42, "affinity": True,
+        })
+        try:
+            proc.stdin.write((json.dumps(req) + "\n").encode())
+            await proc.stdin.drain()
+            line = await proc.stdout.readline()
+            if not line:
+                return False
+            resp = json.loads(line)
+        except (ConnectionResetError, BrokenPipeError, ValueError, json.JSONDecodeError):
+            return False
+
+    if resp.get("status") != "ok":
+        return False
+    job = _jobs[job_id]
+    job["status"] = "completed"
+    job["warm"] = True
+    job["updated_at"] = time.time()
+    _save_msa_from_run(out_dir)
+    return True
+
+
 def _claim_next(slot: int) -> str | None:
     """Pop the first runnable pending job and mark it running. Runs sync on the
     event loop, so claim + status flip is atomic against other workers."""
@@ -203,9 +321,17 @@ async def _worker(slot: int) -> None:
                 if MOCK:
                     await _run_mock(job_id, yaml_path, out_dir)
                 else:
-                    await _run_boltz(
-                        job_id, yaml_path, out_dir, job["_extra_args"], job["_needs_server"], device
-                    )
+                    handled = False
+                    if KEEP_WARM_SECONDS > 0 and MAX_CONCURRENCY == 1:
+                        handled = await _run_warm(
+                            job_id, yaml_path, out_dir, job["_extra_args"],
+                            job["_needs_server"], device,
+                        )
+                    if not handled:
+                        await _run_boltz(
+                            job_id, yaml_path, out_dir, job["_extra_args"],
+                            job["_needs_server"], device,
+                        )
             finally:
                 if lock_fh is not None:
                     await asyncio.to_thread(_funlock, lock_fh)
@@ -230,6 +356,8 @@ async def lifespan(_app: "FastAPI"):
     finally:
         for w in _workers:
             w.cancel()
+        if _warm_proc is not None and _warm_proc.returncode is None:
+            _warm_proc.kill()
 
 
 app = FastAPI(title="Boltz Predict API", lifespan=lifespan)
@@ -479,7 +607,7 @@ _HELP = {
         "GET /jobs?limit=N": "recent jobs (default 20), same shape as GET /jobs/{id}",
         "GET /queue": "{workers, running:[job_id...], pending:[job_id...]}",
         "GET /msa/cache": "{cache_dir, entries, files} -- sequences currently cached",
-        "GET /health": "{status, mock, msa_cache_dir, workers, running, queued, gpu_lock}",
+        "GET /health": "{status, mock, msa_cache_dir, workers, running, queued, gpu_lock, keep_warm_seconds, warm_worker_alive}",
         "GET /help": "this document",
     },
     "polling": (
@@ -565,6 +693,13 @@ _HELP = {
         ),
     },
     "concurrency": {
+        "BOLTZ_KEEP_WARM_SECONDS": "if >0 (and BOLTZ_MAX_CONCURRENCY==1), keep the Boltz-2 "
+                                   "checkpoints resident between jobs via a persistent worker that "
+                                   "self-exits after this many idle seconds (releasing VRAM). "
+                                   "First job after an idle gap pays the ~40 s load; the next runs "
+                                   "warm (~10 s/job). Jobs it cannot handle (MSA cache miss, "
+                                   "templates/constraints, unusual extra_args) fall back to a fresh "
+                                   "subprocess automatically. Default 0 = off.",
         "BOLTZ_MAX_CONCURRENCY": "worker pool size (default 1 = serial). >1 only with real GPU "
                                  "headroom or per-worker device isolation.",
         "BOLTZ_WORKER_DEVICES": "comma-separated CUDA_VISIBLE_DEVICES per worker slot (e.g. '0,1' "
@@ -701,6 +836,8 @@ def health():
         "running": running,
         "queued": len(_queue_order),
         "gpu_lock": GPU_LOCK_PATH,
+        "keep_warm_seconds": KEEP_WARM_SECONDS,
+        "warm_worker_alive": _warm_proc is not None and _warm_proc.returncode is None,
     }
 
 
