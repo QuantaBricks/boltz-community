@@ -85,6 +85,8 @@ import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+from typing import Optional
+
 import uvicorn
 import yaml
 from fastapi import FastAPI, HTTPException
@@ -183,8 +185,12 @@ def _funlock(fh) -> None:
 
 
 # --- optional warm worker (keeps checkpoints resident between jobs) --------
+# The idle window is managed server-side (not by the worker's own --idle-timeout)
+# so a client can change it per request via POST /predict {keep_warm_seconds}.
 _warm_proc: asyncio.subprocess.Process | None = None
 _warm_lock = asyncio.Lock()
+_warm_window = KEEP_WARM_SECONDS  # seconds; 0 disables. Mutable at runtime.
+_warm_last_used = 0.0             # time.monotonic() of the last warm job
 
 
 def _extra_args_to_req(extra_args: str) -> dict | None:
@@ -227,7 +233,7 @@ async def _ensure_warm(device: str | None) -> asyncio.subprocess.Process | None:
     _warm_proc = await asyncio.create_subprocess_exec(
         sys.executable, str(SERVER_DIR / "scripts" / "boltz_worker.py"),
         "--cache", str(Path(os.environ.get("BOLTZ_CACHE", Path.home() / ".boltz"))),
-        "--idle-timeout", str(KEEP_WARM_SECONDS),
+        "--idle-timeout", "0",  # server manages the idle window (_warm_reaper)
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
@@ -274,12 +280,30 @@ async def _run_warm(
 
     if resp.get("status") != "ok":
         return False
+    global _warm_last_used
+    _warm_last_used = time.monotonic()
     job = _jobs[job_id]
     job["status"] = "completed"
     job["warm"] = True
     job["updated_at"] = time.time()
     _save_msa_from_run(out_dir)
     return True
+
+
+async def _warm_reaper() -> None:
+    """Kill the resident worker once it has been idle longer than _warm_window."""
+    global _warm_proc
+    while True:
+        await asyncio.sleep(5)
+        if (
+            _warm_window > 0
+            and _warm_proc is not None
+            and _warm_proc.returncode is None
+            and not _warm_lock.locked()
+            and time.monotonic() - _warm_last_used > _warm_window
+        ):
+            _warm_proc.kill()
+            _warm_proc = None
 
 
 def _claim_next(slot: int) -> str | None:
@@ -322,7 +346,7 @@ async def _worker(slot: int) -> None:
                     await _run_mock(job_id, yaml_path, out_dir)
                 else:
                     handled = False
-                    if KEEP_WARM_SECONDS > 0 and MAX_CONCURRENCY == 1:
+                    if _warm_window > 0 and MAX_CONCURRENCY == 1:
                         handled = await _run_warm(
                             job_id, yaml_path, out_dir, job["_extra_args"],
                             job["_needs_server"], device,
@@ -351,6 +375,7 @@ async def lifespan(_app: "FastAPI"):
     for i in range(MAX_CONCURRENCY):
         _active[i] = None
         _workers.append(asyncio.create_task(_worker(i)))
+    _workers.append(asyncio.create_task(_warm_reaper()))
     try:
         yield
     finally:
@@ -366,6 +391,10 @@ app = FastAPI(title="Boltz Predict API", lifespan=lifespan)
 class PredictRequest(BaseModel):
     toml: str
     extra_args: str = ""
+    # Optional: set the server's keep-warm idle window (seconds) for this and
+    # subsequent jobs. 0 turns keep-warm off and lets the resident worker be
+    # reaped. Omitted -> leave the current window unchanged.
+    keep_warm_seconds: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
@@ -586,9 +615,16 @@ _HELP = {
                 "toml": "string, required -- the prediction spec, see 'toml_format'",
                 "extra_args": "string, optional -- extra flags passed verbatim to `boltz predict` "
                               "(e.g. '--recycling_steps 1 --sampling_steps 50 --diffusion_samples_affinity 1')",
+                "keep_warm_seconds": "int, optional -- set the keep-warm idle window (seconds) for "
+                                     "this and later jobs; 0 turns keep-warm off. Omit to leave it "
+                                     "unchanged. See 'concurrency'.",
             },
-            "returns": "202  {job_id, status:'pending', msa_cache_hits, queue_position}",
+            "returns": "202  {job_id, status:'pending', msa_cache_hits, queue_position, keep_warm_seconds}",
             "errors": "422 if the TOML does not parse",
+        },
+        "POST /warm": {
+            "body": {"seconds": "int -- new keep-warm idle window; 0 disables and reaps the worker"},
+            "returns": "{keep_warm_seconds, warm_worker_alive}",
         },
         "GET /jobs/{job_id}": {
             "returns": "{job_id, status, msa_cache_hits, created_at, updated_at, "
@@ -607,7 +643,7 @@ _HELP = {
         "GET /jobs?limit=N": "recent jobs (default 20), same shape as GET /jobs/{id}",
         "GET /queue": "{workers, running:[job_id...], pending:[job_id...]}",
         "GET /msa/cache": "{cache_dir, entries, files} -- sequences currently cached",
-        "GET /health": "{status, mock, msa_cache_dir, workers, running, queued, gpu_lock, keep_warm_seconds, warm_worker_alive}",
+        "GET /health": "{status, mock, msa_cache_dir, workers, running, queued, gpu_lock, keep_warm_seconds, keep_warm_default, warm_worker_alive, warm_idle_seconds}",
         "GET /help": "this document",
     },
     "polling": (
@@ -693,7 +729,8 @@ _HELP = {
         ),
     },
     "concurrency": {
-        "BOLTZ_KEEP_WARM_SECONDS": "if >0 (and BOLTZ_MAX_CONCURRENCY==1), keep the Boltz-2 "
+        "BOLTZ_KEEP_WARM_SECONDS": "STARTUP DEFAULT for the keep-warm idle window; clients override it "
+                                   "per request via keep_warm_seconds or POST /warm. If >0 (and BOLTZ_MAX_CONCURRENCY==1), keep the Boltz-2 "
                                    "checkpoints resident between jobs via a persistent worker that "
                                    "self-exits after this many idle seconds (releasing VRAM). "
                                    "First job after an idle gap pays the ~40 s load; the next runs "
@@ -724,6 +761,10 @@ def root():
 
 @app.post("/predict", status_code=202)
 async def predict(req: PredictRequest):
+    if req.keep_warm_seconds is not None:
+        global _warm_window
+        _warm_window = max(0, req.keep_warm_seconds)
+
     job_id = uuid.uuid4().hex
     work_dir = JOBS_DIR / job_id
     work_dir.mkdir()
@@ -756,6 +797,23 @@ async def predict(req: PredictRequest):
         "status": "pending",
         "msa_cache_hits": not needs_server,
         "queue_position": len(_queue_order),
+        "keep_warm_seconds": _warm_window,
+    }
+
+
+class WarmRequest(BaseModel):
+    seconds: int
+
+
+@app.post("/warm")
+async def set_warm(req: WarmRequest):
+    """Set the keep-warm idle window (seconds) without submitting a job.
+    0 disables keep-warm and lets the resident worker be reaped."""
+    global _warm_window
+    _warm_window = max(0, req.seconds)
+    return {
+        "keep_warm_seconds": _warm_window,
+        "warm_worker_alive": _warm_proc is not None and _warm_proc.returncode is None,
     }
 
 
@@ -836,8 +894,14 @@ def health():
         "running": running,
         "queued": len(_queue_order),
         "gpu_lock": GPU_LOCK_PATH,
-        "keep_warm_seconds": KEEP_WARM_SECONDS,
+        "keep_warm_seconds": _warm_window,
+        "keep_warm_default": KEEP_WARM_SECONDS,
         "warm_worker_alive": _warm_proc is not None and _warm_proc.returncode is None,
+        "warm_idle_seconds": (
+            round(time.monotonic() - _warm_last_used, 1)
+            if (_warm_proc is not None and _warm_proc.returncode is None)
+            else None
+        ),
     }
 
 
