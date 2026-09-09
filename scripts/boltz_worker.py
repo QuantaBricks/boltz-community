@@ -21,7 +21,14 @@ Protocol: one JSON object per line on stdin, one reply per line on stdout.
     -> {"id":"j1","status":"ok","elapsed_s":6.1,"model_cache":"hit",
         "out_dir":".../boltz_results_in"}
 
-Start:  python scripts/boltz_worker.py --cache ~/.boltz [--flash-attn] [--no-kernels]
+The checkpoints stay resident in VRAM for the life of the process. With no
+request for --idle-timeout seconds (default 60) the worker prints
+{"status":"idle_shutdown"} and exits, freeing all VRAM; the caller spawns a
+fresh worker on the next request (paying the ~35 s load once). Set
+--idle-timeout 0 to stay up forever.
+
+Start:  python scripts/boltz_worker.py --cache ~/.boltz [--idle-timeout 60]
+                                       [--flash-attn] [--no-kernels]
 """
 
 from __future__ import annotations
@@ -292,16 +299,36 @@ class Worker:
 
 
 def main() -> None:
+    import select
+
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--cache", type=Path, default=Path.home() / ".boltz")
     ap.add_argument("--no-kernels", action="store_true")
     ap.add_argument("--flash-attn", action="store_true")
+    ap.add_argument(
+        "--idle-timeout", type=float, default=60.0,
+        help="exit (releasing all VRAM) after this many seconds with no request; 0 = never",
+    )
     args = ap.parse_args()
 
     worker = Worker(args.cache, no_kernels=args.no_kernels, flash_attn=args.flash_attn)
-    print(json.dumps({"status": "ready"}), flush=True)
+    print(json.dumps({"status": "ready", "idle_timeout_s": args.idle_timeout}), flush=True)
 
-    for line in sys.stdin:
+    while True:
+        # Block for a request, but no longer than the idle timeout. When it
+        # fires we return, the process exits, and the CUDA context (with the
+        # resident checkpoints) is torn down by the OS -> VRAM freed. The caller
+        # spawns a fresh worker on the next request, paying the load cost once.
+        if args.idle_timeout > 0:
+            ready, _, _ = select.select([sys.stdin], [], [], args.idle_timeout)
+            if not ready:
+                log(f"[worker] idle {args.idle_timeout:.0f}s, shutting down (releasing VRAM)")
+                print(json.dumps({"status": "idle_shutdown"}), flush=True)
+                return
+        line = sys.stdin.readline()
+        if not line:  # stdin closed
+            log("[worker] stdin closed, exiting")
+            return
         line = line.strip()
         if not line:
             continue

@@ -115,6 +115,20 @@ One JSON object per line on stdin, one per line on stdout:
 `boltz predict`; `batch_predict.py` could target it for `--mode batch` to also
 skip the per-run reload.
 
+### Idle shutdown (scale-to-zero with a warm window)
+
+`--idle-timeout N` (default 60 s): the worker blocks on `select()` for a
+request; if none arrives within N seconds it prints `{"status":"idle_shutdown"}`
+and exits, and the OS tears down the CUDA context so **all VRAM is released**.
+The dispatcher (server.py) then re-spawns a worker on the next request, paying
+the ~35 s load once and running warm again until the next idle gap.
+
+Pick N against the request pattern, not blindly 60 s: a screening burst pays the
+load once and every ligand after is fast; sporadic requests spaced just over N
+apart pay a cold start every time and never benefit. 60 s suits back-to-back
+batch work; 5–15 min suits an interactive service where you want to keep the GPU
+warm between users but still free it overnight. `--idle-timeout 0` never exits.
+
 ## Test plan before enabling
 
 1. `pytest tests/test_regression_v2.py tests/test_affinity.py
