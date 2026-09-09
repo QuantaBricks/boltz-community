@@ -133,3 +133,31 @@ reproducible run‑to‑run.
 
 `--mode both` runs the ligand set both ways and prints a timing summary plus a
 cross‑mode agreement table. `--mode single` / `--mode batch` run just one.
+
+## Speed knobs — measured (RTX 5090, 20 ligands, 384 aa, bs=1, affinity)
+
+| config | wall | peak VRAM | note |
+|---|--:|--:|---|
+| baseline (recycle 1, sampling 50, writes pae/pde) | 153 s | 9.3 GB | |
+| `--screen` (adds TF32 matmul + skips pae/pde npz) | **144 s** | 9.3 GB | ~6%, from TF32; safe |
+| `--screen --flash-attn` | 187 s | 15.9 GB | **regression** on sm_120 — do not use here |
+| `--screen` with TF32 off | 152 s | 9.3 GB | confirms the 6% is TF32 |
+
+- **`--screen`** is the recommended screening preset. It is `--matmul_precision=high`
+  (TF32) + `recycling_steps 1` + `sampling_steps 50` + one diffusion sample +
+  affinity 50 steps / 1 sample + `--no_write_full_pae/pde`. Your own `--boltz-arg`
+  values override any of these.
+- **`--flash_attn` hurts on this GPU** (Blackwell / sm_120): PyTorch SDPA does not
+  pick a faster kernel for these shapes and adds reshape + memory overhead. It may
+  still help on Ampere (A100) — measure before enabling.
+- **cuEquivariance kernels** are not installed on the hrs box and its torch is
+  `cu130` (no matching `cuequivariance-ops-torch` wheel), so the fused
+  trimul/triangle-attention path is unavailable here; boltz falls back to PyTorch.
+  On A100 with a `cu12` build this is a real win.
+- **`--batch_size K>1` does not speed up affinity screening** (measured flat
+  150–153 s for K=1/2/4/8) — the affinity phase is serial at `batch_size=1` and
+  the structure phase is not the bottleneck at low sampling. K only raises peak
+  VRAM (K=8 → 31 GB). Leave it at 1 unless doing structure-only at high sampling.
+- **Two boltz processes on one GPU is slower** (160 s vs 149 s for 20 ligands) —
+  a single process already saturates the card; a second just adds context-switch
+  overhead. Multi-process only helps across multiple GPUs.
