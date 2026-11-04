@@ -1,0 +1,7 @@
+.git
+.venv
+jobs
+**/__pycache__
+.claude
+tests/data/*.pkl
+uv.lock
